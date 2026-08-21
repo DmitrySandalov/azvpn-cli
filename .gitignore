@@ -1,0 +1,13 @@
+# Generated OpenVPN configs embed the gateway's tls-auth key — never commit one.
+*.ovpn
+
+# Azure VPN profiles contain <serversecret>, which is that same key.
+azurevpnconfig*.xml
+profile.xml
+
+# Tokens
+*.auth
+token-*.json
+
+__pycache__/
+*.py[cod]

@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""
+azvpn-cli — headless Azure point-to-site VPN client for Entra-authenticated
+gateways. Python 3 stdlib only, drives openvpn3. No sudo, no GUI.
+
+Why this exists
+---------------
+The Azure VPN Client hardcodes its OAuth *client_id* per cloud and ignores the
+profile's <audience>. If your gateway sits behind a custom Entra app, the stock
+client is refused with AADSTS650057 — Microsoft's first-party app is not
+permitted to request your custom resource. This tool does the OAuth itself,
+using the gateway's own <audience> as the client_id, so the problem disappears.
+
+It also outlives the Azure VPN Client for Linux (retired 2026-08-31): it speaks
+to the gateway directly and needs no vendor binary.
+
+Why openvpn3 and not openvpn
+----------------------------
+Azure P2S with Entra auth is plain OpenVPN where the password is an Entra
+access token (~2.1 kB). Stock openvpn 2.x packs random material, options,
+IV_* peer-info, username and password into a single 2048-byte control-channel
+buffer, so it fails before sending anything:
+
+    TLS Error: Key Method #2 write failed
+
+That is a hard structural limit — not tunable via --max-packet-size, and not
+avoidable by shortening the username. OpenVPN 3 Core is a separate
+implementation without that ceiling; it is also what the Azure VPN Client is
+built on. So openvpn3 is required, not preferred.
+
+    openvpn3-linux is LINUX ONLY. There is no openvpn3 CLI for macOS, and
+    stock openvpn there hits the same 2048-byte wall.
+
+Everything else comes out of the profile XML Azure gives you:
+
+    <fqdn>          -> remote <fqdn> 443 tcp-client
+    <serversecret>  -> 512 hex chars = OpenVPN Static key V1 -> <tls-auth>
+    <audience>      -> OAuth client_id, and scope "<audience>/.default"
+    <tenant>        -> authority
+
+Nothing organisation-specific is embedded. Point --profile at your own
+azurevpnconfig.xml. Safe to share.
+
+Usage
+-----
+    azvpn-cli up      --profile ~/vpn/eu.xml
+    azvpn-cli status  --profile ~/vpn/eu.xml
+    azvpn-cli logs    --profile ~/vpn/eu.xml
+    azvpn-cli down    --profile ~/vpn/eu.xml
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import hashlib
+import http.server
+import json
+import os
+import platform
+import re
+import secrets
+import shutil
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "azvpn-cli"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "azvpn-cli"
+
+REDIRECT_PORT = 2023  # must be a registered redirect URI on the app registration
+REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
+DEFAULT_CA = HERE / "DigiCert_Global_Root_CA.crt"
+
+
+def log(msg: str) -> None:
+    print(f"==> {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1):
+    print(f"error: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def write_private(path: Path, data: str) -> None:
+    """Create 0600 *before* the content lands in the file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(data)
+
+
+# --------------------------------------------------------------------------
+# profile
+# --------------------------------------------------------------------------
+
+
+class Profile:
+    def __init__(self, path: Path):
+        self.path = path
+        try:
+            root = ET.parse(path).getroot()
+        except ET.ParseError as exc:
+            die(f"cannot parse profile {path}: {exc}")
+
+        def texts(*tags: str) -> list[str]:
+            # Namespace- and case-insensitive: the GUI client rewrites <cert>
+            # to <Cert> when it normalises a profile.
+            wanted = {t.lower() for t in tags}
+            return [
+                el.text.strip()
+                for el in root.iter()
+                if el.tag.split("}")[-1].lower() in wanted and el.text and el.text.strip()
+            ]
+
+        def one(*tags: str) -> str | None:
+            got = texts(*tags)
+            return got[0] if got else None
+
+        self.name = one("name") or "azure-vpn"
+        self.fqdn = one("fqdn") or die("no <fqdn> in profile")
+        self.audience = one("audience") or die(
+            "no <audience> in profile — this tool only handles Entra (aad) profiles"
+        )
+        tenant_url = one("tenant") or die("no <tenant> in profile")
+        self.serversecret = one("serversecret")
+        self.dns_servers = texts("dnsserver")
+        self.dns_suffixes = [s.lstrip(".") for s in texts("dnssuffix")]
+
+        parsed = urllib.parse.urlparse(tenant_url)
+        self.authority_host = parsed.netloc or "login.microsoftonline.com"
+        self.tenant = parsed.path.strip("/") or "common"
+
+        # The gateway's TLS cert is NOT issued to the connection FQDN. The FQDN
+        # is  azuregateway-<vnet-id>-<instance>.vpn.azure.com  but the cert CN
+        # is  <vnet-id>.vpn.azure.com. Derive it so verify-x509-name works; the
+        # <instance> suffix changes when Azure reprovisions the gateway, the
+        # vnet id does not.
+        m = re.match(
+            r"^azuregateway-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})-",
+            self.fqdn,
+            re.I,
+        )
+        self.cert_cn = f"{m.group(1)}.vpn.azure.com" if m else None
+
+    def describe(self) -> str:
+        return (
+            f"    profile   : {self.path}\n"
+            f"    name      : {self.name}\n"
+            f"    gateway   : {self.fqdn}:443 tcp\n"
+            f"    audience  : {self.audience}\n"
+            f"    authority : https://{self.authority_host}/{self.tenant}\n"
+            f"    cert CN   : {self.cert_cn or '(not derivable — subject not pinned)'}\n"
+            f"    tls-auth  : {'present' if self.serversecret else 'MISSING <serversecret>'}\n"
+            f"    dns       : {', '.join(self.dns_servers) or '(none)'}"
+            f"  (+{len(self.dns_suffixes)} suffixes)"
+        )
+
+
+# --------------------------------------------------------------------------
+# OAuth — PKCE + loopback, same shape as the GUI client
+# --------------------------------------------------------------------------
+
+
+class _CodeCatcher(http.server.BaseHTTPRequestHandler):
+    result: dict = {}
+
+    def do_GET(self):  # noqa: N802
+        qs = urllib.parse.urlparse(self.path).query
+        _CodeCatcher.result = {k: v[0] for k, v in urllib.parse.parse_qs(qs).items()}
+        ok = "code" in _CodeCatcher.result
+        body = (
+            "<html><body style='font-family:system-ui;padding:3em'>"
+            f"<h2>{'Signed in.' if ok else 'Sign-in failed.'}</h2>"
+            "<p>Close this tab and return to the terminal.</p></body></html>"
+        ).encode()
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_a):
+        pass
+
+
+class TokenStore:
+    def __init__(self, profile: Profile):
+        self.p = profile
+        self.path = CACHE_DIR / f"token-{profile.audience}.json"
+
+    @property
+    def _base(self) -> str:
+        return f"https://{self.p.authority_host}/{self.p.tenant}/oauth2/v2.0"
+
+    @property
+    def _scope(self) -> str:
+        return f"{self.p.audience}/.default offline_access"
+
+    def load(self) -> dict | None:
+        try:
+            return json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save(self, tok: dict) -> None:
+        tok = dict(tok)
+        tok["expires_at"] = time.time() + int(tok.get("expires_in", 3600)) - 120
+        write_private(self.path, json.dumps(tok))
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+    def _post(self, data: dict) -> dict:
+        req = urllib.request.Request(
+            f"{self._base}/token",
+            data=urllib.parse.urlencode(data).encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=ssl.create_default_context()) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode(errors="replace")
+            try:
+                j = json.loads(raw)
+                raw = f"{j.get('error')}: {j.get('error_description', '')[:500]}"
+            except json.JSONDecodeError:
+                raw = raw[:500]
+            raise RuntimeError(raw) from None
+
+    def _interactive(self) -> dict:
+        verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode()
+        challenge = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        state = secrets.token_urlsafe(16)
+        try:
+            srv = http.server.HTTPServer(("127.0.0.1", REDIRECT_PORT), _CodeCatcher)
+        except OSError as exc:
+            die(
+                f"cannot bind {REDIRECT_URI} ({exc}).\n"
+                "       The Azure VPN Client GUI uses the same port — quit it and retry."
+            )
+        url = f"{self._base}/authorize?" + urllib.parse.urlencode(
+            {
+                "client_id": self.p.audience,
+                "response_type": "code",
+                "redirect_uri": REDIRECT_URI,
+                "response_mode": "query",
+                "scope": self._scope,
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "prompt": "select_account",
+            }
+        )
+        _CodeCatcher.result = {}
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+        log("opening a browser for sign-in…")
+        print(f"    if it does not open, visit:\n    {url}\n", file=sys.stderr)
+        webbrowser.open(url)
+        t.join(timeout=300)
+        srv.server_close()
+
+        res = _CodeCatcher.result
+        if not res:
+            die("timed out waiting for the sign-in redirect")
+        if "error" in res:
+            die(f"{res['error']}: {res.get('error_description', '')[:500]}")
+        if res.get("state") != state:
+            die("OAuth state mismatch — aborting")
+        return self._post(
+            {
+                "client_id": self.p.audience,
+                "grant_type": "authorization_code",
+                "code": res["code"],
+                "redirect_uri": REDIRECT_URI,
+                "code_verifier": verifier,
+                "scope": self._scope,
+            }
+        )
+
+    def access_token(self, force: bool = False) -> str:
+        cached = self.load()
+        if cached and not force and cached.get("expires_at", 0) > time.time():
+            return cached["access_token"]
+        if cached and cached.get("refresh_token") and not force:
+            try:
+                log("refreshing token silently…")
+                tok = self._post(
+                    {
+                        "client_id": self.p.audience,
+                        "grant_type": "refresh_token",
+                        "refresh_token": cached["refresh_token"],
+                        "scope": self._scope,
+                    }
+                )
+                self.save(tok)
+                return tok["access_token"]
+            except RuntimeError as exc:
+                log(f"silent refresh failed ({exc}); falling back to the browser")
+        tok = self._interactive()
+        self.save(tok)
+        log("token acquired")
+        return tok["access_token"]
+
+    def claims(self) -> dict:
+        tok = self.load() or {}
+        try:
+            payload = tok["access_token"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload))
+        except (KeyError, IndexError, ValueError, binascii.Error):
+            return {}
+
+    def describe(self) -> str:
+        tok = self.load()
+        if not tok:
+            return "    token     : none cached"
+        left = int(tok.get("expires_at", 0) - time.time())
+        c = self.claims()
+        who = c.get("upn") or c.get("preferred_username") or c.get("unique_name") or "?"
+        return (
+            f"    token     : {'valid, %dm left' % (left // 60) if left > 0 else 'EXPIRED'}\n"
+            f"    user      : {who}\n"
+            f"    refresh   : {'yes' if tok.get('refresh_token') else 'no'}"
+        )
+
+
+# --------------------------------------------------------------------------
+# OpenVPN config
+# --------------------------------------------------------------------------
+
+
+def static_key_block(hex_secret: str) -> str:
+    h = hex_secret.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]+", h):
+        die("<serversecret> is not hex")
+    if len(h) != 512:
+        die(f"<serversecret> is {len(h) // 2} bytes; an OpenVPN static key must be 256")
+    body = "\n".join(h[i : i + 32] for i in range(0, len(h), 32))
+    return f"-----BEGIN OpenVPN Static key V1-----\n{body}\n-----END OpenVPN Static key V1-----"
+
+
+def ca_block(ca_path: Path) -> str:
+    if not ca_path.is_file():
+        die(f"root CA not found: {ca_path}")
+    raw = ca_path.read_bytes()
+    if raw.lstrip().startswith(b"-----BEGIN"):
+        return raw.decode().strip()
+    out = subprocess.run(
+        ["openssl", "x509", "-inform", "DER", "-outform", "PEM"], input=raw, capture_output=True
+    )
+    if out.returncode != 0:
+        die(f"cannot convert {ca_path} to PEM: {out.stderr.decode(errors='replace')[:200]}")
+    return out.stdout.decode().strip()
+
+
+def ovpn_config(p: Profile, ca_path: Path) -> str:
+    if not p.serversecret:
+        die("profile has no <serversecret>; cannot build the tls-auth key")
+    # Azure pushes DNS servers but NO domains. With --dns-scope tunnel that
+    # leaves zero routing domains, so private zones silently resolve via public
+    # DNS. The suffixes only exist in the profile XML, so declare them here as
+    # client-side dhcp-options and let openvpn3 register them.
+    domains = "\n".join(f"dhcp-option DOMAIN {d}" for d in p.dns_suffixes) or (
+        "# profile declares no <dnssuffix>"
+    )
+    verify = (
+        f"verify-x509-name {p.cert_cn} name"
+        if p.cert_cn
+        else (
+            "# gateway cert CN not derivable from the FQDN, so the subject is not\n"
+            "# pinned. remote-cert-tls + the CA chain still apply. Use --verify-name."
+        )
+    )
+    return f"""# Generated by azvpn-cli — do not share, contains the gateway tls-auth key.
+# Source profile: {p.path}
+client
+dev tun
+proto tcp-client
+remote {p.fqdn} 443
+resolv-retry infinite
+nobind
+persist-tun
+
+remote-cert-tls server
+{verify}
+tls-version-min 1.2
+
+# The Entra access token is the password. openvpn3 resolves auth-user-pass at
+# import time and rejects a missing file, so this is the bare form — azvpn-cli
+# feeds the token to `session-start` on stdin, never writing it to disk.
+auth-user-pass
+
+cipher AES-256-GCM
+data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC
+auth SHA256
+
+# Split DNS: these suffixes route to the VPN resolver, everything else keeps
+# using your normal DNS. Paired with `--dns-scope tunnel`, set by azvpn-cli.
+{domains}
+
+verb 3
+
+<ca>
+{ca_block(ca_path)}
+</ca>
+
+<tls-auth>
+{static_key_block(p.serversecret)}
+</tls-auth>
+key-direction 1
+"""
+
+
+# --------------------------------------------------------------------------
+# openvpn3 driver
+# --------------------------------------------------------------------------
+
+
+def o3(*args: str, **kw) -> subprocess.CompletedProcess:
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    return subprocess.run(["openvpn3", *args], **kw)
+
+
+def require_openvpn3() -> None:
+    if platform.system() != "Linux":
+        die(
+            f"openvpn3-linux is Linux only; this is {platform.system()}.\n"
+            "       Stock openvpn cannot carry Entra tokens (2048-byte control-channel\n"
+            "       buffer), so there is no supported path on this platform yet."
+        )
+    if not shutil.which("openvpn3"):
+        die(
+            "openvpn3 not found — it is required, not optional.\n"
+            "       https://openvpn.net/as-docs/openvpn3-linux.html"
+        )
+
+
+def session_for(name: str) -> dict | None:
+    for block in o3("sessions-list").stdout.split("---"):
+        if f"Config name: {name}" in block:
+            got = {}
+            for line in block.splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    got[k.strip()] = v.strip()
+            return got
+    return None
+
+
+def iface_addr(dev: str) -> str:
+    out = subprocess.run(
+        ["ip", "-brief", "addr", "show", dev], capture_output=True, text=True
+    ).stdout.strip()
+    return out or dev
+
+
+def route_count(dev: str) -> int:
+    out = subprocess.run(["ip", "route", "show", "dev", dev], capture_output=True, text=True).stdout
+    return len([x for x in out.splitlines() if x.strip()])
+
+
+def cmd_gen(p: Profile, name: str, ca: Path) -> Path:
+    path = CONFIG_DIR / f"{name}.ovpn"
+    write_private(path, ovpn_config(p, ca))
+    log(f"wrote {path}  (0600 — contains the tls-auth key)")
+    return path
+
+
+def cmd_up(p: Profile, name: str, ca: Path, force: bool) -> int:
+    require_openvpn3()
+    if session_for(name):
+        log(f"{name} is already connected")
+        return cmd_status(p, name)
+
+    token = TokenStore(p).access_token(force=force)
+    path = cmd_gen(p, name, ca)
+
+    o3("config-remove", "--config", name, "--force")
+    r = o3("config-import", "--config", str(path), "--name", name, "--persistent")
+    if r.returncode != 0:
+        die(f"config-import failed: {(r.stdout + r.stderr).strip()[:400]}")
+    # Split DNS instead of hijacking every query — matches the GUI client.
+    o3("config-manage", "--config", name, "--dns-scope", "tunnel")
+
+    log(f"connecting to {p.fqdn}:443 tcp")
+    upn = TokenStore(p).claims().get("upn", name)
+    r = subprocess.run(
+        ["openvpn3", "session-start", "--config", name],
+        input=f"{upn}\n{token}\n",
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    if "Connected to" not in out:
+        log("session-start did not report a connection:")
+        for line in out.strip().splitlines()[-12:]:
+            print(f"    {line}", file=sys.stderr)
+        return 1
+    return cmd_status(p, name)
+
+
+def cmd_down(name: str) -> int:
+    require_openvpn3()
+    if not session_for(name):
+        log(f"{name} is not connected")
+        return 0
+    o3("session-manage", "--config", name, "--disconnect")
+    if session_for(name):
+        die(f"could not disconnect {name}")
+    log(f"{name} disconnected")
+    return 0
+
+
+def cmd_status(p: Profile, name: str) -> int:
+    print(f"==> {name}")
+    print(p.describe())
+    print(TokenStore(p).describe())
+    sess = session_for(name) if shutil.which("openvpn3") else None
+    if not sess:
+        print("    tunnel    : DOWN")
+        return 1
+    dev = sess.get("Device", "tun0")
+    print(f"    tunnel    : UP — {sess.get('Status', 'connected')}")
+    print(f"    interface : {iface_addr(dev)}")
+    print(f"    routes    : {route_count(dev)} via {dev}")
+    return 0
+
+
+def cmd_logs(name: str) -> int:
+    require_openvpn3()
+    if not session_for(name):
+        die(f"{name} is not connected — openvpn3 logs are attached to a session")
+    return subprocess.run(["openvpn3", "log", "--config", name]).returncode
+
+
+# --------------------------------------------------------------------------
+
+
+def resolve_profile(arg: str | None) -> Path:
+    """Profile XML: --profile, else $AZVPN_PROFILE, else the default location.
+
+    Multiple tunnels need no registry — keep one XML per gateway wherever you
+    like and point --profile at it. The connection name comes from <name>.
+    """
+    for cand in (arg, os.environ.get("AZVPN_PROFILE"), CONFIG_DIR / "profile.xml"):
+        if cand and Path(cand).is_file():
+            return Path(cand).resolve()
+    if arg:
+        die(f"no such file: {arg}")
+    die(
+        "no profile. Download the gateway config from the Azure portal, unzip,\n"
+        "       and point at AzureVPN/azurevpnconfig.xml:\n"
+        "           azvpn-cli up --profile path/to/azurevpnconfig.xml\n"
+        f"       or place it at {CONFIG_DIR / 'profile.xml'}, or set AZVPN_PROFILE."
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="azvpn-cli",
+        description="Headless Azure point-to-site VPN client (Entra auth), via openvpn3.",
+    )
+    ap.add_argument("command", choices=["login", "logout", "gen", "up", "down", "status", "logs"])
+    ap.add_argument("--profile", help="path to the Azure VPN profile XML")
+    ap.add_argument("--name", help="connection name (default: profile <name>)")
+    ap.add_argument("--ca", help=f"gateway root CA (default: {DEFAULT_CA.name})")
+    ap.add_argument("--verify-name", help="override the expected gateway cert CN")
+    ap.add_argument("--force-login", action="store_true", help="ignore cached tokens")
+    args = ap.parse_args()
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    profile = Profile(resolve_profile(args.profile))
+    if args.verify_name:
+        profile.cert_cn = args.verify_name
+    name = args.name or profile.name
+    ca = Path(args.ca).resolve() if args.ca else DEFAULT_CA
+
+    if args.command == "login":
+        TokenStore(profile).access_token(force=args.force_login)
+        print(TokenStore(profile).describe())
+        return 0
+    if args.command == "logout":
+        TokenStore(profile).clear()
+        log("cached token removed")
+        return 0
+    if args.command == "gen":
+        cmd_gen(profile, name, ca)
+        return 0
+    if args.command == "up":
+        return cmd_up(profile, name, ca, args.force_login)
+    if args.command == "down":
+        return cmd_down(name)
+    if args.command == "status":
+        return cmd_status(profile, name)
+    if args.command == "logs":
+        return cmd_logs(name)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        sys.exit(130)
