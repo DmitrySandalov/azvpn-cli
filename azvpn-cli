@@ -399,6 +399,19 @@ resolv-retry infinite
 nobind
 persist-tun
 
+# The gateway is completely silent on an idle tunnel: it pushes no keepalive
+# and sends nothing back, not even in reply to our pings (PACKETS_IN stays
+# flat while PACKETS_OUT climbs). OpenVPN 3 Core's built-in 50-second
+# receive timeout therefore always expires, and the session dies with
+# "Session invalidated: KEEPALIVE_TIMEOUT" roughly every 53 seconds, forever.
+# Any non-zero ping-restart just moves the interval, so the timer is disabled
+# outright. The transport is TCP, so a dead link is expected to surface as a
+# socket error rather than as silence, but that path has not been tested here
+# against a hard drop. After a suspend or a Wi-Fi switch, expect to re-run `up`.
+# `ping 10` stays to keep NAT and stateful firewalls from dropping the flow.
+ping 10
+ping-restart 0
+
 remote-cert-tls server
 {verify}
 tls-version-min 1.2

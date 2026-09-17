@@ -228,6 +228,22 @@ VERIFY OK: depth=0, …
   without it, sign-in fails with `AADSTS50011` and an Entra admin has to add it.
 - **openvpn caps username/password length.** Entra access tokens are large; if
   yours is rejected on length, that limit is the reason.
+- **The gateway is silent on an idle tunnel, and that used to reconnect it every
+  53 seconds.** It pushes no `keepalive` and answers nothing, not even the
+  client's own pings: `openvpn3 session-stats` shows `PACKETS_OUT` climbing
+  while `PACKETS_IN` sits still. OpenVPN 3 Core's built-in 50-second receive
+  timeout then fires (`Session invalidated: KEEPALIVE_TIMEOUT`), the session
+  restarts 2 s later, and the desktop notifier pops "Session is reconnecting"
+  about 68 times an hour. The generated profile ships `ping-restart 0` for that
+  reason; raising the value only changes the interval. The trade-off: with no
+  restart timer, a path that dies silently (suspend, Wi-Fi switch) is left to
+  TCP to notice, which is untested here. Re-run `azvpn-cli up` if the tunnel
+  goes quiet.
+- **The access token is handed to openvpn3 once, at `session-start`.** openvpn3
+  caches it and replays it on every reconnect, so once the token expires (about
+  70 minutes) any reconnect fails and openvpn3 retries every 5 s forever while
+  still reporting the session UP. `azvpn-cli status` shows `token : EXPIRED`
+  with `tunnel : UP — Connection, Client reconnect`. Fix: `azvpn-cli up`.
 - **Don't run this and the GUI client at the same time** against the same
   gateway — two tunnels, conflicting routes.
 
@@ -243,6 +259,8 @@ VERIFY OK: depth=0, …
 | Silent hang, no TLS handshake | tls-auth key wrong | Check `<serversecret>` is 512 hex chars |
 | `Key Method #2 write failed` | you are on stock `openvpn`, not `openvpn3` | install openvpn3 — see [Why openvpn3](#why-openvpn3-and-not-openvpn) |
 | `AUTH_FAILED` | token rejected | `azvpn-cli login --force-login` |
+| "Session is reconnecting" notification every ~53 s | gateway sends nothing when idle, core keepalive timeout fires | already handled by `ping-restart 0` in the generated profile; check it survived a re-`gen` |
+| Endless reconnect every 5 s, `status` says `token : EXPIRED` | access token expired mid-session; openvpn3 replays the cached credential | `azvpn-cli up` (silent refresh) |
 | Connects, private names resolve to public IPs | routing domains missing | `resolvectl status tun0` — expect the profile's suffixes under `DNS Domain`; if absent, re-run `azvpn-cli gen` |
 | `Maximum option line length (256) exceeded` | a long generated line | Report it — the suffix list is already externalised |
 
