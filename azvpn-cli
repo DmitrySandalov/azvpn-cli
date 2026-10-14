@@ -31,6 +31,18 @@ built on. So openvpn3 is required, not preferred.
     openvpn3-linux is LINUX ONLY. There is no openvpn3 CLI for macOS, and
     stock openvpn there hits the same 2048-byte wall.
 
+Android (Termux) has no openvpn3 either. The tunnel is run by OpenVPN for
+Android (ics-openvpn) with its OpenVPN 3 core enabled; azvpn-cli only signs in
+and renders the profile: `share` opens the .ovpn in the app once and puts the required custom
+options on the clipboard, and `token`
+puts a fresh access token on the clipboard to paste as the password on each
+connect. Two clients that do NOT work, both measured against an Entra gateway:
+OpenVPN Connect for Android cuts the password to 127 characters, and the
+OpenVPN 2 engine of OpenVPN for Android cuts it on its management channel.
+The app's import also drops `cipher`, so it announces `cipher BF-CBC` and the
+gateway closes the connection; set `cipher AES-256-GCM` in the profile's
+custom options (see the README).
+
 Everything else comes out of the profile XML Azure gives you:
 
     <fqdn>          -> remote <fqdn> 443 tcp-client
@@ -47,6 +59,10 @@ Usage
     azvpn-cli status  --profile ~/vpn/eu.xml
     azvpn-cli logs    --profile ~/vpn/eu.xml
     azvpn-cli down    --profile ~/vpn/eu.xml
+
+    # Android, in Termux with Termux:API, tunnel run by OpenVPN for Android
+    azvpn-cli share   --profile ~/vpn/eu.xml   # once: import; options on clipboard
+    azvpn-cli token   --profile ~/vpn/eu.xml   # each connect: paste as password
 """
 
 from __future__ import annotations
@@ -82,6 +98,14 @@ REDIRECT_PORT = 2023  # must be a registered redirect URI on the app registratio
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}"
 DEFAULT_CA = HERE / "DigiCert_Global_Root_CA.crt"
 
+# Termux sets PREFIX to its own app directory. There is no openvpn3 there; the
+# tunnel belongs to an Android VPN app and this tool only feeds it.
+IS_TERMUX = "com.termux" in os.environ.get("PREFIX", "")
+CLIPBOARD_SECONDS = 60
+# OpenVPN for Android's import drops `cipher`; without it the login announces
+# BF-CBC and the gateway closes the connection. Added by hand as custom options.
+ANDROID_CUSTOM_OPTIONS = "cipher AES-256-GCM\ndata-ciphers AES-256-GCM:AES-128-GCM"
+
 
 def log(msg: str) -> None:
     print(f"==> {msg}", file=sys.stderr)
@@ -90,6 +114,15 @@ def log(msg: str) -> None:
 def die(msg: str, code: int = 1):
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+def open_browser(url: str) -> None:
+    # Python's webbrowser module finds no browser on Termux; termux-open-url
+    # hands the URL to Android, which opens the default browser.
+    if IS_TERMUX and shutil.which("termux-open-url"):
+        subprocess.run(["termux-open-url", url], check=False)
+    else:
+        webbrowser.open(url)
 
 
 def write_private(path: Path, data: str) -> None:
@@ -273,7 +306,7 @@ class TokenStore:
         t.start()
         log("opening a browser for sign-in…")
         print(f"    if it does not open, visit:\n    {url}\n", file=sys.stderr)
-        webbrowser.open(url)
+        open_browser(url)
         t.join(timeout=300)
         srv.server_close()
 
@@ -453,7 +486,16 @@ def o3(*args: str, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(["openvpn3", *args], **kw)
 
 
+ANDROID_HINT = (
+    "on Android the tunnel is run by OpenVPN for Android, not by this tool:\n"
+    "           azvpn-cli share   # once, import the profile into the app\n"
+    "           azvpn-cli token   # each connect, paste as the password"
+)
+
+
 def require_openvpn3() -> None:
+    if IS_TERMUX:
+        die(ANDROID_HINT)
     if platform.system() != "Linux":
         die(
             f"openvpn3-linux is Linux only; this is {platform.system()}.\n"
@@ -496,6 +538,95 @@ def cmd_gen(p: Profile, name: str, ca: Path) -> Path:
     write_private(path, ovpn_config(p, ca))
     log(f"wrote {path}  (0600 — contains the tls-auth key)")
     return path
+
+
+def clipboard_digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def clear_clipboard_later(token: str, seconds: int) -> None:
+    """Wipe the clipboard after `seconds`, unless something else replaced it.
+
+    A detached copy of this script does the wait, so the shell returns at once.
+    It gets only a hash of the token, never the token itself.
+    """
+    subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "_clear-clipboard",
+         clipboard_digest(token), str(seconds)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _clear_clipboard(digest: str, seconds: str) -> int:
+    time.sleep(int(seconds))
+    cur = subprocess.run(["termux-clipboard-get"], capture_output=True, text=True).stdout
+    if clipboard_digest(cur.strip()) == digest:
+        subprocess.run(["termux-clipboard-set"], input="", text=True, check=False)
+    return 0
+
+
+def cmd_token(p: Profile, force: bool, to_stdout: bool) -> int:
+    """Hand a fresh access token to a VPN client this tool does not drive."""
+    store = TokenStore(p)
+    token = store.access_token(force=force)
+    upn = store.claims().get("upn") or "?"
+    if to_stdout:
+        print(token)
+        return 0
+    if not shutil.which("termux-clipboard-set"):
+        die(
+            "no clipboard helper. On Termux: pkg install termux-api, plus the\n"
+            "       Termux:API app. Elsewhere, --stdout prints the token for piping."
+        )
+    r = subprocess.run(["termux-clipboard-set"], input=token, text=True)
+    if r.returncode != 0:
+        die("termux-clipboard-set failed; is the Termux:API app installed?")
+    clear_clipboard_later(token, CLIPBOARD_SECONDS)
+    print(store.describe().splitlines()[0], file=sys.stderr)
+    log(f"username: {upn}")
+    log(f"password: on the clipboard, cleared in {CLIPBOARD_SECONDS} s")
+    return 0
+
+
+def cmd_share(p: Profile, name: str, ca: Path) -> int:
+    """Render the .ovpn, open it in the Android app that imports profiles, and
+    put ANDROID_CUSTOM_OPTIONS on the clipboard (not secret) for the one-time
+    profile setup. A later `token` replaces the clipboard.
+
+    This is a VIEW ("open with") intent with a chooser: the OpenVPN apps
+    register for opening .ovpn files but not for receiving shares, so
+    `termux-open --send` never lists them. termux-open serves the file through
+    Termux's own content provider, so the tls-auth key is never copied to
+    shared storage.
+    """
+    if not shutil.which("termux-open"):
+        die("share needs Termux (termux-open); elsewhere use `gen` and import the file")
+    path = cmd_gen(p, name, ca)
+    r = subprocess.run(
+        ["termux-open", "--chooser", "--content-type", "application/x-openvpn-profile", str(path)]
+    )
+    if r.returncode != 0:
+        die("termux-open failed")
+    upn = TokenStore(p).claims().get("upn")
+    who = f" (yours: {upn})" if upn else " (shown by `azvpn-cli token`)"
+    copied = shutil.which("termux-clipboard-set") and subprocess.run(
+        ["termux-clipboard-set"], input=ANDROID_CUSTOM_OPTIONS, text=True
+    ).returncode == 0
+    # Plain lines, no "==>" prefix, so the options copy cleanly from the terminal.
+    print(
+        "\nPick OpenVPN for Android and import with the dialog defaults. Once, in the app:\n"
+        "  1. Settings: check \"OpenVPN 3 Core\" (unchecked by default)\n"
+        "  2. Profile > Advanced > Custom options: add below the 4 imported lines\n\n"
+        f"{ANDROID_CUSTOM_OPTIONS}\n\n"
+        + ("  (these two lines are on the clipboard now)\n" if copied else "")
+        + "  3. Username: your full UPN, e.g. first.last@example.com" + who + ".\n"
+        "     Do not save a password.\n\n"
+        "Then, for each connect: run `azvpn-cli token` (it replaces the clipboard\n"
+        "with the access token for 60 s) and paste it as the password.\n",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def cmd_up(p: Profile, name: str, ca: Path, force: bool) -> int:
@@ -548,6 +679,9 @@ def cmd_status(p: Profile, name: str) -> int:
     print(f"==> {name}")
     print(p.describe())
     print(TokenStore(p).describe())
+    if IS_TERMUX:
+        print("    tunnel    : run by OpenVPN for Android (not visible from Termux)")
+        return 0
     sess = session_for(name) if shutil.which("openvpn3") else None
     if not sess:
         print("    tunnel    : DOWN")
@@ -593,12 +727,20 @@ def main() -> int:
         prog="azvpn-cli",
         description="Headless Azure point-to-site VPN client (Entra auth), via openvpn3.",
     )
-    ap.add_argument("command", choices=["login", "logout", "gen", "up", "down", "status", "logs"])
+    if sys.argv[1:2] == ["_clear-clipboard"]:
+        return _clear_clipboard(*sys.argv[2:4])
+    ap.add_argument(
+        "command",
+        choices=["login", "logout", "gen", "up", "down", "status", "logs", "token", "share"],
+    )
     ap.add_argument("--profile", help="path to the Azure VPN profile XML")
     ap.add_argument("--name", help="connection name (default: profile <name>)")
     ap.add_argument("--ca", help=f"gateway root CA (default: {DEFAULT_CA.name})")
     ap.add_argument("--verify-name", help="override the expected gateway cert CN")
     ap.add_argument("--force-login", action="store_true", help="ignore cached tokens")
+    ap.add_argument(
+        "--stdout", action="store_true", help="token: print it instead of using the clipboard"
+    )
     args = ap.parse_args()
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -621,6 +763,10 @@ def main() -> int:
     if args.command == "gen":
         cmd_gen(profile, name, ca)
         return 0
+    if args.command == "token":
+        return cmd_token(profile, args.force_login, args.stdout)
+    if args.command == "share":
+        return cmd_share(profile, name, ca)
     if args.command == "up":
         return cmd_up(profile, name, ca, args.force_login)
     if args.command == "down":

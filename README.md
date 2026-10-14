@@ -3,7 +3,8 @@
 Headless Azure point-to-site VPN client for **Entra-authenticated** gateways.
 Python 3 stdlib driving `openvpn3` — no pip packages, no GUI, **no sudo**.
 
-**Linux only.** See [Why openvpn3](#why-openvpn3-and-not-openvpn).
+**Linux**, plus **Android** through Termux and OpenVPN for Android (see
+[Android](#android-termux--openvpn-for-android)). See [Why openvpn3](#why-openvpn3-and-not-openvpn).
 
 > **Unaffiliated** with Microsoft or OpenVPN Inc. Not endorsed by either.
 > "Azure", "Entra" and "OpenVPN" are trademarks of their respective owners.
@@ -20,6 +21,7 @@ profile with `--profile`. Safe to share as-is.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Usage](#usage)
+- [Android (Termux + OpenVPN for Android)](#android-termux--openvpn-for-android)
 - [Files it writes](#files-it-writes)
 - [Why openvpn3 and not openvpn](#why-openvpn3-and-not-openvpn)
 - [Split DNS](#split-dns)
@@ -117,8 +119,90 @@ All commands:
 | `down` | Stop the tunnel |
 | `status` | Profile, token, tunnel, interface, route count |
 | `logs [-f]` | Tail the openvpn log |
+| `token` | Fresh access token to the clipboard (Termux), or `--stdout` |
+| `share` | `gen`, open the `.ovpn` in an Android VPN app to import it, and put the two required custom options on the clipboard (Termux) |
 
 Other flags: `--name` (override the connection name), `--ca`, `--verify-name`.
+
+## Android (Termux + OpenVPN for Android)
+
+Android has no openvpn3 CLI. The tunnel is run by **OpenVPN for Android**
+(ics-openvpn, by Arne Schwabe) with its **OpenVPN 3 core** turned on.
+azvpn-cli runs in [Termux](https://termux.dev) and does the parts the app
+cannot: the Entra sign-in and the profile.
+
+Requirements: Termux, `pkg install python termux-api`, the **Termux:API** app,
+and **OpenVPN for Android**. Keep the profile XML in the Termux home (for
+example `~/.config/azvpn-cli/profile.xml`, mode 0600), not on shared storage:
+any app with storage permission can read `/sdcard`.
+
+Right after installing OpenVPN for Android, open its **Settings** and check
+**OpenVPN 3 Core**. It is unchecked by default, and the default OpenVPN 2
+engine cannot carry the token (see below).
+
+```bash
+azvpn-cli share   # once: opens the profile in the app chooser -> import;
+                  #       custom options for step 2 go on the clipboard
+azvpn-cli token   # each connect: token on the clipboard for 60 s
+```
+
+1. `share` renders the `.ovpn`, copies the two custom options for step 2 to
+   the clipboard, and opens the profile with an "open with" intent through
+   Termux's content provider, so the tls-auth key never lands on `/sdcard`.
+   Pick OpenVPN for Android. In its "Convert Config File" dialog keep the
+   defaults (Compatibility mode **Modern defaults**, TLS Security Profile
+   **legacy (default)**) and save. The import log lists the options it could
+   not map (`ping 10`, `ping-restart 0`, `resolv-retry infinite`,
+   `tls-version-min 1.2`) and keeps them as custom options.
+2. Once, in the imported profile, **Advanced → Custom options**, add these two
+   lines below the four the import put there. `share` already put them on the
+   clipboard, so a long-press paste is enough; it also prints them without a
+   prefix. Paste before running `token`, which replaces the clipboard:
+
+   ```
+   cipher AES-256-GCM
+   data-ciphers AES-256-GCM:AES-128-GCM
+   ```
+
+   `cipher` is not in the import log because the importer maps it to a UI
+   setting, and that mapping is where it gets lost.
+
+   Without this the gateway closes the connection right after the login (see
+   below). Save the username: your **full** UPN, e.g. `first.last@example.com`
+   (`token` and `share` print yours). Do not save a password.
+3. `token` signs in through the phone browser on first use (the loopback
+   redirect on port 2023 reaches Termux), then silently refreshes. It copies
+   the access token to the clipboard and clears it after 60 seconds, unless you
+   copied something else meanwhile.
+4. Connect and paste the token as the password.
+
+`up`, `down` and `logs` refuse to run on Termux; the app owns the tunnel.
+The same expiry rule applies as with openvpn3: the app replays the password on
+reconnect, so after about 70 minutes a reconnect fails. Run `token` again and
+reconnect.
+
+### Why this app, and why the custom options
+
+Measured against an Entra gateway with a relay and a stand-in gateway on the
+phone (packet sizes and the decoded login message, never the token):
+
+| Client | Result | Why |
+|---|---|---|
+| OpenVPN Connect 3.7 (Android) | ❌ `NETWORK_EOF_ERROR` | sends only the first **127 characters** of the password; a profile with the token inline is refused with "line is too long" |
+| OpenVPN for Android, OpenVPN 2 engine | ❌ | the management channel splits the token ("unknown command ...") |
+| OpenVPN for Android, OpenVPN 3 core | ✅ with the custom options | sends the full token, but its import drops `cipher`, so the login announces **`cipher BF-CBC`**, and the gateway closes on that |
+
+Everything else was ruled out on the way: certificates (the TLS handshake
+completes), the tls-auth key, the Android client identity (`IV_PLAT=android`),
+the cipher list, the TLS 1.3 post-quantum key share, and the network path.
+
+DNS while connected (measured on a phone): Android sends every lookup from
+apps to the gateway's resolvers, not only names under the profile's suffixes,
+so private endpoints resolve to their private addresses. The suffixes are not
+applied as search domains, so a bare host name does not resolve. Tools that
+read their own `/etc/resolv.conf` instead of Android's resolver, such as a
+proot Linux distro in Termux, bypass this and get public addresses; point them
+at the profile's `<dnsserver>` addresses while connected.
 
 ## Files it writes
 
@@ -209,6 +293,8 @@ VERIFY OK: depth=0, …
   names keep using normal DNS
 - ✅ L7 — authenticated Azure Storage download through a private endpoint
 - ✅ `up` / `down` / `status` / `logs` idempotent, teardown removes `tun0`
+- ✅ **Android** (Termux + OpenVPN for Android, OpenVPN 3 core): connected,
+  both pushed DNS resolvers answer through the tunnel
 - ❌ **macOS: not supported.** openvpn3-linux is Linux only.
 
 ## Gotchas
