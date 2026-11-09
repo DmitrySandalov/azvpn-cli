@@ -6,6 +6,12 @@ Python 3 stdlib driving `openvpn3` — no pip packages, no GUI, **no sudo**.
 **Linux**, plus **Android** through Termux and OpenVPN for Android (see
 [Android](#android-termux--openvpn-for-android)). See [Why openvpn3](#why-openvpn3-and-not-openvpn).
 
+For **AWS Client VPN** endpoints with SAML sign-in (Entra ID or IAM Identity
+Center), see the sibling project
+[awsvpn-cli](https://github.com/DmitrySandalov/awsvpn-cli). It has the same
+design: stdlib Python, openvpn3 on Linux, Termux plus OpenVPN for Android on
+the phone.
+
 > **Unaffiliated** with Microsoft or OpenVPN Inc. Not endorsed by either.
 > "Azure", "Entra" and "OpenVPN" are trademarks of their respective owners.
 > The protocol details here were derived from Azure's own published VPN profile
